@@ -1,0 +1,704 @@
+-- ============================================================================
+--  PlasmaRice Planner -- Conky panel engine
+--  Everything this panel shows comes from settings.lua in this folder.
+--  Use the settings app (configure.sh) to change it, or edit the file by hand.
+--  Settings are re-read on every refresh, so changes appear within a few
+--  seconds without restarting the widget.
+-- ============================================================================
+
+require 'cairo'
+
+local HOME = os.getenv('HOME') or ''
+local DIR = HOME .. '/.config/conky/__SLUG__'
+
+local ORDER = {
+  'cpu', 'cores', 'ram', 'swap', 'gpu', 'gputemp', 'temp', 'fan', 'freq',
+  'disk', 'diski', 'net', 'wifi', 'load', 'top', 'topmem', 'running',
+  'processes', 'battery', 'uptime', 'transfer', 'kernel', 'clock',
+}
+
+local CHARTS = { none = true, bar = true, line = true, gauge = true, pie = true, donut = true }
+local SAMPLES = 48
+local PROBE_INTERVAL = 2
+
+-- Graphics cards are not one thing in Conky: the NVIDIA driver has its own
+-- variables, AMD and Intel report through sysfs. These probes ask whichever
+-- one answers and print an empty string when no card is detected at all.
+local GPU_USAGE_PROBE = [[v=$(cat /sys/class/drm/card*/device/gpu_busy_percent 2>/dev/null | head -n1); [ -n "$v" ] || v=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -n1); printf '%s' "$v"]]
+local GPU_TEMP_PROBE = [[t=''; for h in /sys/class/hwmon/hwmon*; do if [ -z "$t" ]; then n=$(cat $h/name 2>/dev/null); case $n in amdgpu|radeon|nvidia|xe|i915) c=$(cat $h/temp1_input 2>/dev/null); if [ -n "$c" ]; then t=$((c / 1000)); fi ;; esac; fi; done; if [ -z "$t" ]; then t=$(nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader,nounits 2>/dev/null | head -n1); fi; printf '%s' "$t"]]
+
+local DEFAULTS = {
+  name = 'Widget',
+  font = 'Noto Sans',
+  font_size = 13,
+  accent = '7DD3FC',
+  text = 'EEF0F4',
+  label = '8B8F9A',
+  bar = '7DD3FC',
+  warn = 'FF5F6D',
+  warn_at = 80,
+  bg = '0D0D12',
+  bg_opacity = 78,
+  bg_blur = 12,
+  bg_image = '',
+  radius = 16,
+  padding = 16,
+  border_width = 0,
+  border_color = 'FFFFFF',
+  glow = false,
+  label_mode = 'left',
+  uppercase = true,
+  separator = false,
+  chart_height = 26,
+  bar_height = 4,
+  bar_width = 120,
+}
+
+local READING_DEFAULTS = { on = false, label = '', target = '', count = 0, format = '', chart = 'none' }
+
+local LABELS = {
+  cpu = 'CPU usage', ram = 'Memory', swap = 'Swap', disk = 'Disk', net = 'Network up / down',
+  cores = 'CPU cores', temp = 'CPU temperature', load = 'Load average', uptime = 'Uptime',
+  top = 'Top processes', topmem = 'Top memory users', processes = 'Process count',
+  running = 'Running processes', battery = 'Battery', clock = 'Clock',
+  gpu = 'GPU usage', gputemp = 'GPU temperature', fan = 'Fan speed', freq = 'CPU frequency',
+  diski = 'Disk activity', wifi = 'Wi-Fi signal', transfer = 'Data transferred', kernel = 'Kernel',
+}
+
+local current = nil
+local hist = {}
+
+-- ---------------------------------------------------------------------------
+-- helpers
+-- ---------------------------------------------------------------------------
+
+local function clamp(value, low, high)
+  if value == nil then return low end
+  if value < low then return low end
+  if value > high then return high end
+  return value
+end
+
+local function toint(value, fallback, low, high)
+  local n = tonumber(value)
+  if not n then return fallback end
+  return math.floor(clamp(n, low, high) + 0.5)
+end
+
+local function number(expr)
+  local ok, value = pcall(conky_parse, expr)
+  if not ok or value == nil then return nil end
+  return tonumber(value)
+end
+
+local function probe(command)
+  return '${execi ' .. PROBE_INTERVAL .. ' ' .. command .. '}'
+end
+
+local function hex_rgb(hex)
+  local clean = tostring(hex or ''):gsub('#', ''):gsub('%s', '')
+  if #clean == 3 then
+    clean = clean:sub(1, 1):rep(2) .. clean:sub(2, 2):rep(2) .. clean:sub(3, 3):rep(2)
+  end
+  if #clean ~= 6 then clean = 'ffffff' end
+  local n = tonumber(clean, 16)
+  if not n then n = 16777215 end
+  local r = math.floor(n / 65536) % 256
+  local g = math.floor(n / 256) % 256
+  local b = n % 256
+  return r / 255, g / 255, b / 255
+end
+
+-- ---------------------------------------------------------------------------
+-- settings
+-- ---------------------------------------------------------------------------
+
+local function settings()
+  local ok, loaded = pcall(dofile, DIR .. '/settings.lua')
+  if not ok or type(loaded) ~= 'table' then return current or DEFAULTS end
+
+  local s = {}
+  for key, value in pairs(DEFAULTS) do s[key] = value end
+  for key, value in pairs(loaded) do s[key] = value end
+
+  s.readings = {}
+  for _, id in ipairs(ORDER) do
+    local row = {}
+    for key, value in pairs(READING_DEFAULTS) do row[key] = value end
+    local given = type(loaded.readings) == 'table' and loaded.readings[id] or nil
+    if type(given) == 'table' then
+      for key, value in pairs(given) do row[key] = value end
+    end
+    s.readings[id] = row
+  end
+
+  current = s
+  return s
+end
+
+-- ---------------------------------------------------------------------------
+-- reading values
+-- ---------------------------------------------------------------------------
+
+local function target_suffix(row)
+  local target = tostring(row.target or '')
+  if target == '' then return '' end
+  return ' ' .. target
+end
+
+local function sensor(row)
+  local target = tostring(row.target or '')
+  if target == '' then return '0' end
+  return target
+end
+
+local function reading_values(id, row)
+  local suffix = target_suffix(row)
+
+  if id == 'cpu' then
+    local pct = number('${cpu}')
+    return '${cpu}%', pct, pct
+  end
+  if id == 'ram' then
+    local pct = number('${memperc}')
+    return '${mem} / ${memmax}  ${memperc}%', pct, pct
+  end
+  if id == 'disk' then
+    local free = number('${fs_free_perc' .. suffix .. '}')
+    local pct = free and (100 - free) or nil
+    return '${fs_used' .. suffix .. '} / ${fs_size' .. suffix .. '}  ${fs_free_perc' .. suffix .. '}%', pct, pct
+  end
+  if id == 'swap' then
+    local pct = number('${swapperc}')
+    return '${swap} / ${swapmax}  ${swapperc}%', pct, pct
+  end
+  if id == 'gpu' then
+    local source = tostring(row.target or '')
+    if source == 'nvidia' then
+      local pct = number('${nvidia gpuutil}')
+      return '${nvidia gpuutil}%', pct, pct
+    end
+    local expr = probe(GPU_USAGE_PROBE)
+    return expr .. '%', number(expr), number(expr)
+  end
+  if id == 'gputemp' then
+    local source = tostring(row.target or '')
+    if source == 'nvidia' then
+      local pct = number('${nvidia gputemp}')
+      return '${nvidia gputemp} C', pct, pct
+    end
+    if source ~= '' and source ~= 'auto' then
+      local pct = number('${hwmon ' .. source .. ' temp 1}')
+      return '${hwmon ' .. source .. ' temp 1} C', pct, pct
+    end
+    local expr = probe(GPU_TEMP_PROBE)
+    return expr .. ' C', number(expr), number(expr)
+  end
+  if id == 'fan' then
+    local pct = number('${hwmon ' .. sensor(row) .. ' fan 1}')
+    return '${hwmon ' .. sensor(row) .. ' fan 1} rpm', pct, pct
+  end
+  if id == 'freq' then
+    return '${freq_g} GHz', nil, number('${freq_g}')
+  end
+  if id == 'diski' then
+    return 'R ${diskio_read' .. suffix .. '}  W ${diskio_write' .. suffix .. '}', nil, nil
+  end
+  if id == 'net' then
+    local down = number('${downspeed' .. suffix .. '}')
+    local up = number('${upspeed' .. suffix .. '}')
+    return '↓ ${downspeed' .. suffix .. '}  ↑ ${upspeed' .. suffix .. '}', nil, down, up
+  end
+  if id == 'wifi' then
+    local iface = tostring(row.target or '')
+    if iface == '' then iface = 'wlan0' end
+    local pct = number('${wireless_link_qual_perc ' .. iface .. '}')
+    return '${wireless_link_qual_perc ' .. iface .. '}%', pct, pct
+  end
+  if id == 'running' then return '${running_processes}', nil, nil end
+  if id == 'transfer' then
+    return '${totaldown' .. suffix .. '}  ${totalup' .. suffix .. '}', nil, nil
+  end
+  if id == 'kernel' then return '${kernel}', nil, nil end
+  if id == 'temp' then
+    local pct = number('${hwmon ' .. sensor(row) .. ' temp 1}')
+    return '${hwmon ' .. sensor(row) .. ' temp 1} C', pct, pct
+  end
+  if id == 'load' then
+    local value = number('${loadavg 1}')
+    return '${loadavg}', nil, value
+  end
+  if id == 'uptime' then return '${uptime}', nil, nil end
+  if id == 'processes' then return '${processes}', nil, nil end
+  if id == 'battery' then
+    local pct = number('${battery_percent' .. suffix .. '}')
+    return '${battery_percent' .. suffix .. '}%', pct, pct
+  end
+  if id == 'clock' then
+    local fmt = tostring(row.format or '')
+    if fmt == '' then fmt = '%H:%M' end
+    return '${time ' .. fmt .. '}', nil, nil
+  end
+  return '', nil, nil
+end
+
+local function reading_label(id, row, s)
+  local custom = tostring(row.label or '')
+  local base = custom ~= '' and custom or (LABELS[id] or id)
+  if s.uppercase then return string.upper(base) end
+  return base
+end
+
+-- ---------------------------------------------------------------------------
+-- rows
+-- ---------------------------------------------------------------------------
+
+local function build_rows(s)
+  local rows = {}
+
+  for _, id in ipairs(ORDER) do
+    local row = s.readings[id]
+    if row and row.on then
+      local chart = tostring(row.chart or 'none')
+      if not CHARTS[chart] then chart = 'none' end
+
+      if id == 'cores' then
+        local count = toint(row.count, 4, 1, 16)
+        for index = 0, count - 1 do
+          rows[#rows + 1] = {
+            key = 'cores' .. index,
+            label = 'Core ' .. (index + 1),
+            value = '${cpu cpu' .. index .. '}%',
+            pct = number('${cpu cpu' .. index .. '}'),
+            chart = chart,
+            mode = 'left',
+          }
+        end
+      elseif id == 'top' then
+        local count = toint(row.count, 1, 1, 5)
+        local custom = tostring(row.label or '')
+        for index = 1, count do
+          rows[#rows + 1] = {
+            key = 'top' .. index,
+            label = custom ~= '' and custom or ('${top name ' .. index .. '}'),
+            value = '${top cpu ' .. index .. '}%',
+            chart = 'none',
+            mode = 'left',
+          }
+        end
+      elseif id == 'topmem' then
+        local count = toint(row.count, 1, 1, 5)
+        local custom = tostring(row.label or '')
+        for index = 1, count do
+          rows[#rows + 1] = {
+            key = 'topmem' .. index,
+            label = custom ~= '' and custom or ('${top_mem name ' .. index .. '}'),
+            value = '${top_mem mem ' .. index .. '}%',
+            chart = 'none',
+            mode = 'left',
+          }
+        end
+      else
+        local value, pct, numeric, numeric2 = reading_values(id, row)
+        rows[#rows + 1] = {
+          key = id,
+          label = reading_label(id, row, s),
+          value = value,
+          pct = pct,
+          numeric = numeric,
+          numeric2 = numeric2,
+          chart = chart,
+          mode = s.label_mode,
+        }
+      end
+    end
+  end
+
+  return rows
+end
+
+local function value_text(row, s)
+  local warn_at = tonumber(s.warn_at) or 0
+  if row.pct and warn_at > 0 and row.pct >= warn_at then
+    return '${color2}' .. row.value .. '${color}'
+  end
+  return '${color}' .. row.value
+end
+
+local function row_lines(row, s)
+  local label = '${color1}' .. row.label .. '${color}'
+  local value = value_text(row, s)
+
+  if row.mode == 'above' then
+    return { label, value }
+  end
+  if row.mode == 'inline' then
+    return { label .. '  ' .. value }
+  end
+  return { label .. '${alignr}' .. value }
+end
+
+local function chart_space(row, s)
+  if row.chart == 'bar' then return math.max(2, tonumber(s.bar_height) or 4) + 8 end
+  if row.chart == 'line' then return math.max(10, tonumber(s.chart_height) or 26) end
+  if row.chart == 'none' then return 0 end
+  return clamp((tonumber(s.chart_height) or 26) * 1.6, 34, 96)
+end
+
+local function line_height(s)
+  return math.max(9, (tonumber(s.font_size) or 13) * 1.42)
+end
+
+-- Every row: its text lines, then the blank lines a chart needs.
+local function layout(s)
+  local rows = build_rows(s)
+  local row_height = line_height(s)
+  local line = 0
+
+  for _, row in ipairs(rows) do
+    row.lines = row_lines(row, s)
+    row.reserved = chart_space(row, s)
+    row.chart_lines = row.reserved > 0 and math.max(1, math.ceil(row.reserved / row_height)) or 0
+    row.text_line = line
+    row.chart_line = line + #row.lines
+    line = line + #row.lines + row.chart_lines
+  end
+
+  return rows, line
+end
+
+-- called by conky: ${lua_parse widget_rows}
+function conky_widget_rows()
+  local s = settings()
+  local rows, total = layout(s)
+  local out = {}
+
+  for _, row in ipairs(rows) do
+    for _, line in ipairs(row.lines) do out[#out + 1] = line end
+    for _ = 1, row.chart_lines do out[#out + 1] = '' end
+  end
+
+  if #out == 0 then
+    return '${color1}Open the settings app and pick a reading${color}'
+  end
+
+  -- a trailing line that is not empty keeps the chart space in the window
+  if out[#out] == '' then out[#out] = ' ' end
+
+  return table.concat(out, '\n')
+end
+
+-- ---------------------------------------------------------------------------
+-- drawing
+-- ---------------------------------------------------------------------------
+
+local function rounded_rect(cr, x, y, w, h, radius)
+  local r = clamp(radius or 0, 0, math.min(w, h) / 2)
+  if r < 0.6 then
+    cairo_rectangle(cr, x, y, w, h)
+    return
+  end
+  cairo_new_sub_path(cr)
+  cairo_arc(cr, x + w - r, y + r, r, -math.pi / 2, 0)
+  cairo_arc(cr, x + w - r, y + h - r, r, 0, math.pi / 2)
+  cairo_arc(cr, x + r, y + h - r, r, math.pi / 2, math.pi)
+  cairo_arc(cr, x + r, y + r, r, math.pi, 1.5 * math.pi)
+  cairo_close_path(cr)
+end
+
+local function paint_image(cr, path, w, h, radius, blur)
+  local img = cairo_image_surface_create_from_png(path)
+  if cairo_surface_status(img) ~= 0 then
+    cairo_surface_destroy(img)
+    return false
+  end
+
+  local iw = cairo_image_surface_get_width(img)
+  local ih = cairo_image_surface_get_height(img)
+  if iw <= 0 or ih <= 0 then
+    cairo_surface_destroy(img)
+    return false
+  end
+
+  local scale = math.max(w / iw, h / ih)
+  local dw, dh = iw * scale, ih * scale
+  local dx, dy = (w - dw) / 2, (h - dh) / 2
+
+  cairo_save(cr)
+  rounded_rect(cr, 0, 0, w, h, radius)
+  cairo_clip(cr)
+
+  local factor = math.floor((tonumber(blur) or 0) / 4)
+  if factor >= 1 then
+    -- soften by shrinking first and stretching the small copy back up
+    local sw = math.max(1, math.floor(w / factor))
+    local sh = math.max(1, math.floor(h / factor))
+    local small = cairo_image_surface_create(0, sw, sh)
+    local scratch = cairo_create(small)
+    cairo_scale(scratch, sw / dw, sh / dh)
+    cairo_set_source_surface(scratch, img, dx, dy)
+    cairo_paint(scratch)
+    cairo_destroy(scratch)
+
+    cairo_save(cr)
+    cairo_scale(cr, w / sw, h / sh)
+    cairo_set_source_surface(cr, small, 0, 0)
+    local pattern = cairo_get_source(cr)
+    cairo_pattern_set_filter(pattern, CAIRO_FILTER_BILINEAR)
+    cairo_paint(cr)
+    cairo_restore(cr)
+    cairo_surface_destroy(small)
+  else
+    cairo_set_source_surface(cr, img, dx, dy)
+    cairo_paint(cr)
+  end
+
+  cairo_restore(cr)
+  cairo_surface_destroy(img)
+  return true
+end
+
+local function chart_colour(row, s)
+  local warn_at = tonumber(s.warn_at) or 0
+  if row.pct and warn_at > 0 and row.pct >= warn_at then
+    return hex_rgb(s.warn)
+  end
+  return hex_rgb(s.bar)
+end
+
+local function draw_bar(cr, x, y, w, h, pct, colour)
+  local radius = h / 2
+  local r, g, b = colour
+  local track_r, track_g, track_b = hex_rgb(current and current.label or '8B8F9A')
+
+  cairo_new_path(cr)
+  rounded_rect(cr, x, y, w, h, radius)
+  cairo_set_source_rgba(cr, track_r, track_g, track_b, 0.22)
+  cairo_fill(cr)
+
+  local filled = w * clamp(pct, 0, 100) / 100
+  if filled < radius then filled = radius end
+  cairo_new_path(cr)
+  rounded_rect(cr, x, y, filled, h, radius)
+  cairo_set_source_rgba(cr, r, g, b, 1)
+  cairo_fill(cr)
+end
+
+-- One line, filled up to the line itself, and an optional second line for the
+-- other direction (upload against download). The colour never fills the whole
+-- chart box: it stops where the line is.
+local function draw_line(cr, x, y, w, h, series, second, colour)
+  local r, g, b = colour
+  local peak = 0
+
+  for _, value in ipairs(series or {}) do
+    if value > peak then peak = value end
+  end
+  for _, value in ipairs(second or {}) do
+    if value > peak then peak = value end
+  end
+  if peak <= 0 then peak = 1 end
+  peak = peak * 1.1
+
+  local function trace(values)
+    for index, value in ipairs(values) do
+      local px = x + (index - 1) * w / (#values - 1)
+      local py = y + h - clamp(value / peak, 0, 1) * h
+      if index == 1 then cairo_move_to(cr, px, py) else cairo_line_to(cr, px, py) end
+    end
+  end
+
+  if series and #series > 1 then
+    cairo_new_path(cr)
+    cairo_move_to(cr, x, y + h)
+    trace(series)
+    cairo_line_to(cr, x + w, y + h)
+    cairo_close_path(cr)
+    cairo_set_source_rgba(cr, r, g, b, 0.22)
+    cairo_fill(cr)
+
+    cairo_new_path(cr)
+    trace(series)
+    cairo_set_source_rgba(cr, r, g, b, 1)
+    cairo_set_line_width(cr, 1.4)
+    cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND)
+    cairo_stroke(cr)
+  end
+
+  if second and #second > 1 then
+    cairo_new_path(cr)
+    trace(second)
+    cairo_set_dash(cr, { 3, 3 }, 2, 0)
+    cairo_set_source_rgba(cr, r, g, b, 0.55)
+    cairo_set_line_width(cr, 1.2)
+    cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND)
+    cairo_stroke(cr)
+    cairo_set_dash(cr, {}, 0, 0)
+  end
+end
+
+local function draw_gauge(cr, x, y, size, pct, colour)
+  local r, g, b = colour
+  local track_r, track_g, track_b = hex_rgb(current and current.label or '8B8F9A')
+  local stroke = math.max(3, size * 0.09)
+  local radius = size / 2 - stroke
+  local cx, cy = x + size / 2, y + size / 2
+
+  cairo_set_line_width(cr, stroke)
+  cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND)
+
+  cairo_new_sub_path(cr)
+  cairo_arc(cr, cx, cy, radius, 0.75 * math.pi, 2.25 * math.pi)
+  cairo_set_source_rgba(cr, track_r, track_g, track_b, 0.22)
+  cairo_stroke(cr)
+
+  if pct and pct > 0 then
+    cairo_new_sub_path(cr)
+    cairo_arc(cr, cx, cy, radius, 0.75 * math.pi, 0.75 * math.pi + 1.5 * math.pi * clamp(pct, 0, 100) / 100)
+    cairo_set_source_rgba(cr, r, g, b, 1)
+    cairo_stroke(cr)
+  end
+end
+
+local function draw_pie(cr, x, y, size, pct, colour)
+  local r, g, b = colour
+  local track_r, track_g, track_b = hex_rgb(current and current.label or '8B8F9A')
+  local radius = size / 2
+  local cx, cy = x + radius, y + radius
+
+  cairo_new_path(cr)
+  cairo_arc(cr, cx, cy, radius, 0, 2 * math.pi)
+  cairo_set_source_rgba(cr, track_r, track_g, track_b, 0.22)
+  cairo_fill(cr)
+
+  local angle = 2 * math.pi * clamp(pct, 0, 100) / 100
+  if angle > 0 then
+    cairo_new_path(cr)
+    cairo_move_to(cr, cx, cy)
+    cairo_arc(cr, cx, cy, radius, -math.pi / 2, -math.pi / 2 + angle)
+    cairo_close_path(cr)
+    cairo_set_source_rgba(cr, r, g, b, 1)
+    cairo_fill(cr)
+  end
+end
+
+local function draw_donut(cr, x, y, size, pct, colour)
+  local r, g, b = colour
+  local track_r, track_g, track_b = hex_rgb(current and current.label or '8B8F9A')
+  local stroke = size * 0.2
+  local radius = size / 2 - stroke / 2
+  local cx, cy = x + size / 2, y + size / 2
+
+  cairo_set_line_width(cr, stroke)
+  cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND)
+
+  cairo_new_sub_path(cr)
+  cairo_arc(cr, cx, cy, radius, 0, 2 * math.pi)
+  cairo_set_source_rgba(cr, track_r, track_g, track_b, 0.22)
+  cairo_stroke(cr)
+
+  local angle = 2 * math.pi * clamp(pct, 0, 100) / 100
+  if angle > 0 then
+    cairo_new_sub_path(cr)
+    cairo_arc(cr, cx, cy, radius, -math.pi / 2, -math.pi / 2 + angle)
+    cairo_set_source_rgba(cr, r, g, b, 1)
+    cairo_stroke(cr)
+  end
+end
+
+local function remember(key, value)
+  if value == nil then return hist[key] or {} end
+  local series = hist[key] or {}
+  series[#series + 1] = value
+  while #series > SAMPLES do table.remove(series, 1) end
+  hist[key] = series
+  return series
+end
+
+-- called by conky: lua_draw_hook_pre = 'draw_panel'
+function conky_draw_panel()
+  if conky_window == nil then return end
+
+  local s = settings()
+  local rows, total_lines = layout(s)
+
+  local surface = cairo_xlib_surface_create(conky_window.display, conky_window.drawable, conky_window.visual, conky_window.width, conky_window.height)
+  local cr = cairo_create(surface)
+
+  local w, h = conky_window.width, conky_window.height
+  local padding = math.max(0, tonumber(s.padding) or 0)
+  local radius = math.max(0, tonumber(s.radius) or 0)
+  local opacity = clamp(tonumber(s.bg_opacity) or 0, 0, 100) / 100
+
+  -- panel background
+  if opacity > 0 then
+    local br, bg, bb = hex_rgb(s.bg)
+    if s.glow then
+      local ar, ag, ab = hex_rgb(s.accent)
+      cairo_new_path(cr)
+      rounded_rect(cr, 0, 0, w, h, radius)
+      cairo_set_source_rgba(cr, ar, ag, ab, 0.18)
+      cairo_fill(cr)
+    end
+
+    local image = tostring(s.bg_image or '')
+    if image ~= '' then
+      pcall(paint_image, cr, image, w, h, radius, s.bg_blur)
+    end
+
+    cairo_new_path(cr)
+    rounded_rect(cr, 0, 0, w, h, radius)
+    cairo_set_source_rgba(cr, br, bg, bb, opacity)
+    cairo_fill(cr)
+  end
+
+  -- border
+  local border = math.max(0, tonumber(s.border_width) or 0)
+  if border > 0 then
+    local cr2, cg, cb = hex_rgb(s.border_color)
+    cairo_new_path(cr)
+    rounded_rect(cr, border / 2, border / 2, w - border, h - border, radius)
+    cairo_set_line_width(cr, border)
+    cairo_set_source_rgba(cr, cr2, cg, cb, 0.4)
+    cairo_stroke(cr)
+  end
+
+  -- charts
+  local row_height = line_height(s)
+  local text_height = conky_window.text_height or math.max(1, h - 2 * padding)
+  if total_lines > 0 and text_height > 0 then row_height = text_height / total_lines end
+
+  local origin_y = conky_window.text_y or ((h - text_height) / 2)
+  local chart_width = math.min(math.max(40, tonumber(s.bar_width) or 120), math.max(20, w - 2 * padding))
+
+  for _, row in ipairs(rows) do
+    if row.chart ~= 'none' and row.chart_lines > 0 then
+      local x = padding
+      local y = origin_y + row.chart_line * row_height
+      local reserved = math.max(2, row.chart_lines * row_height - 2)
+      local colour = chart_colour(row, s)
+
+      if row.chart == 'bar' then
+        local pct = row.pct or 0
+        draw_bar(cr, x, y + 2, chart_width, math.max(2, tonumber(s.bar_height) or 4), pct, colour)
+      elseif row.chart == 'line' then
+        local series = remember(row.key, row.numeric)
+        local other = nil
+        if row.numeric2 ~= nil then other = remember(row.key .. ':second', row.numeric2) end
+        draw_line(cr, x, y + 1, math.min(chart_width + 30, w - 2 * padding), reserved, series, other, colour)
+      elseif row.chart == 'gauge' then
+        local size = math.min(reserved, chart_width)
+        draw_gauge(cr, x, y, size, row.pct or 0, colour)
+      elseif row.chart == 'pie' then
+        local size = math.min(reserved, chart_width)
+        draw_pie(cr, x, y, size, row.pct or 0, colour)
+      elseif row.chart == 'donut' then
+        local size = math.min(reserved, chart_width)
+        draw_donut(cr, x, y, size, row.pct or 0, colour)
+      end
+    end
+  end
+
+  cairo_destroy(cr)
+  cairo_surface_destroy(surface)
+end

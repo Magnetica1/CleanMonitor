@@ -1,0 +1,642 @@
+#!/usr/bin/env bash
+# ============================================================================
+#  PlasmaRice Planner -- settings app for the "__NAME__" panel
+#  Changes are written to settings.lua (read by the widget on every refresh)
+#  and to the .conf file for the things Conky itself controls: position, font
+#  and the text colours. The widget is restarted after every change.
+# ============================================================================
+
+APP="__NAME__"
+SLUG="__SLUG__"
+DIR="$HOME/.config/conky/$SLUG"
+CONF="$DIR/$SLUG.conf"
+SETTINGS="$DIR/settings.lua"
+
+if ! command -v kdialog >/dev/null 2>&1; then
+  echo "kdialog is missing. Install it with: sudo apt install kdialog" >&2
+  exit 1
+fi
+
+if [ ! -f "$SETTINGS" ]; then
+  kdialog --error "Could not find settings.lua in $DIR.\nRe-export the widget from PlasmaRice Planner."
+  exit 1
+fi
+
+if [ ! -f "$CONF" ]; then
+  kdialog --error "Could not find $SLUG.conf in $DIR.\nRe-export the widget from PlasmaRice Planner."
+  exit 1
+fi
+
+# ---------------------------------------------------------------- helpers ---
+
+clean() {
+  printf '%s' "$1" | tr -d '"' | tr -d '\\' | tr -d '\`' | tr -d '&' | tr -d ',' | tr -d '=' | tr '\n' ' ' | sed 's/  */ /g; s/^ *//; s/ *$//'
+}
+
+valid_hex() {
+  printf '%s' "${1#\#}" | grep -Eq '^[0-9a-fA-F]{6}$'
+}
+
+get_raw() { sed -n "s/^  $1 = \(.*\),\$/\1/p" "$SETTINGS" | head -n 1; }
+get_text() { get_raw "$1" | sed -e "s/^'//" -e "s/'\$//"; }
+get_num() { get_raw "$1" | grep -Eo '^[0-9]+' | head -n 1; }
+
+set_raw() { sed -i "s|^  $1 = .*,\$|  $1 = $2,|" "$SETTINGS"; }
+set_num() { set_raw "$1" "$2"; }
+set_text() { local v; v=$(clean "$2"); set_raw "$1" "'$v'"; }
+set_bool() { if [ "$2" = "true" ]; then set_raw "$1" "true"; else set_raw "$1" "false"; fi; }
+
+r_raw() { sed -n "s/^    $1 = { \(.*\) },\$/\1/p" "$SETTINGS" | tr ',' '\n' | sed -n "s/^ *$2 = //p" | head -n 1; }
+r_text() { r_raw "$1" "$2" | sed -e "s/^'//" -e "s/'\$//"; }
+r_num() { r_raw "$1" "$2" | grep -Eo '^[0-9]+' | head -n 1; }
+r_set() {
+  awk -v id="$1" -v field="$2" -v value="$3" '
+    $0 ~ "^    " id " = \\{ " {
+      start = index($0, "{ ")
+      stop = match($0, / \},/)
+      head = substr($0, 1, start + 1)
+      body = substr($0, start + 2, stop - start - 2)
+      tail = substr($0, stop)
+      count = split(body, parts, ", ")
+      joined = ""
+      for (i = 1; i <= count; i++) {
+        key = parts[i]
+        sub(/ =.*/, "", key)
+        if (key == field) parts[i] = field " = " value
+        joined = joined (i > 1 ? ", " : "") parts[i]
+      }
+      print head joined tail
+      next
+    }
+    { print }
+  ' "$SETTINGS" > "$SETTINGS.new" && mv "$SETTINGS.new" "$SETTINGS"
+}
+r_text_set() { local v; v=$(clean "$3"); r_set "$1" "$2" "'$v'"; }
+r_bool() { if [ "$3" = "true" ]; then r_set "$1" "$2" "true"; else r_set "$1" "$2" "false"; fi; }
+
+conf_set() { sed -i "s|^\(\s*\)$1 = .*,\$|\1$1 = $2,|" "$CONF"; }
+
+runs_on() { [ "$(r_raw "$1" on)" = "true" ]; }
+
+restart_widget() {
+  if ! command -v conky >/dev/null 2>&1; then
+    kdialog --error "Conky is not installed yet.\n\nsudo apt install conky-all"
+    return 1
+  fi
+  pkill -f "conky -c $CONF" 2>/dev/null
+  sleep 0.2
+  if command -v setsid >/dev/null 2>&1; then
+    setsid conky -c "$CONF" >/dev/null 2>&1 &
+  else
+    nohup conky -c "$CONF" >/dev/null 2>&1 &
+  fi
+  sleep 0.3
+  return 0
+}
+
+number_input() { # title, default, min, max -> echoed
+  local value
+  value=$(kdialog --inputbox "$1" "$2")
+  [ -z "$value" ] && return 1
+  case "$value" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  if [ "$value" -lt "$3" ]; then value="$3"; fi
+  if [ "$value" -gt "$4" ]; then value="$4"; fi
+  printf '%s' "$value"
+}
+
+ask_colour() { # current value -> echoed
+  local picked hex
+  picked=$(kdialog --getcolor --default "${1:-#ffffff}")
+  [ -z "$picked" ] && return 1
+  hex=$(printf '%s' "$picked" | tr -d '#[:space:]' | cut -c1-6 | tr '[:lower:]' '[:upper:]')
+  valid_hex "$hex" || return 1
+  printf '%s' "$hex"
+}
+
+theme_value() { # section, key -> echoed
+  local scheme file value
+  scheme=$(awk -F= '/^colorScheme=/{print $2}' "$HOME/.config/kdeglobals" 2>/dev/null | head -n 1 | tr -d '[:space:]')
+  for file in "$HOME/.local/share/color-schemes/$scheme.colors" "/usr/share/color-schemes/$scheme.colors" "$HOME/.config/kdeglobals"; do
+    [ -f "$file" ] || continue
+    value=$(awk -v section="$1" -v key="$2" '
+      /^\[/ { inside = ($0 == "[" section "]"); next }
+      inside && index($0, key "=") == 1 { split($0, parts, "="); print parts[2]; exit }
+    ' "$file")
+    if [ -n "$value" ]; then printf '%s' "$value"; return 0; fi
+  done
+  return 1
+}
+
+rgb_hex() {
+  local r g b
+  IFS=, read -r r g b <<< "$1"
+  printf '%02X%02X%02X' "${r:-0}" "${g:-0}" "${b:-0}"
+}
+
+# ------------------------------------------------------------------ colour ---
+
+colour_menu() {
+  while true; do
+    local choice value
+    choice=$(kdialog --title "$APP -- colours" --menu "Colours" \
+      accent "Accent" \
+      bar "Bars and graphs" \
+      warn "High use colour" \
+      warn_at "High use from ($(get_num warn_at)%)" \
+      text "Values" \
+      label "Labels" \
+      border "Border" \
+      back "Back")
+    [ $? -ne 0 ] && return 0
+
+    case "$choice" in
+      accent|bar|warn|text|label|border)
+        value=$(ask_colour "$(get_text "$choice")") || continue
+        set_text "$choice" "$value"
+        sync_conf_colours
+        restart_widget
+        ;;
+      warn_at)
+        value=$(number_input "Show the high use colour from this percentage" "$(get_num warn_at)" 1 100) || continue
+        set_num warn_at "$value"
+        ;;
+      back) return 0 ;;
+    esac
+  done
+}
+
+sync_conf_colours() {
+  conf_set default_color "'#$(get_text text)'"
+  conf_set color1 "'#$(get_text label)'"
+  conf_set color2 "'#$(get_text warn)'"
+  conf_set color3 "'#$(get_text accent)'"
+}
+
+# -------------------------------------------------------------- background ---
+
+background_menu() {
+  while true; do
+    local choice value pick
+    choice=$(kdialog --title "$APP -- background" --menu "Background" \
+      bg "Colour" \
+      bg_opacity "Solidity ($(get_num bg_opacity)%)" \
+      bg_blur "Blur ($(get_num bg_blur))" \
+      bg_image "Image: $(if [ -n "$(get_text bg_image)" ]; then echo "set"; else echo "none"; fi)" \
+      radius "Rounded corners ($(get_num radius)px)" \
+      back "Back")
+    [ $? -ne 0 ] && return 0
+
+    case "$choice" in
+      bg)
+        value=$(ask_colour "$(get_text bg)") || continue
+        set_text bg "$value"
+        sync_conf_colours
+        restart_widget
+        ;;
+      bg_opacity)
+        value=$(number_input "How solid should the panel be? 0 is invisible, 100 is solid." "$(get_num bg_opacity)" 0 100) || continue
+        set_num bg_opacity "$value"
+        restart_widget
+        ;;
+      bg_blur)
+        value=$(number_input "Softness of the background image (0 to 24)." "$(get_num bg_blur)" 0 24) || continue
+        set_num bg_blur "$value"
+        ;;
+      bg_image)
+        pick=$(kdialog --getopenfilename "$HOME" "Images (*.png *.PNG)")
+        [ -z "$pick" ] && continue
+        set_text bg_image "$pick"
+        ;;
+      radius)
+        value=$(number_input "Rounded corner radius in pixels (0 for square corners)." "$(get_num radius)" 0 40) || continue
+        set_num radius "$value"
+        ;;
+      back) return 0 ;;
+    esac
+  done
+}
+
+# -------------------------------------------------------------------- text ---
+
+font_choice() {
+  local choice family
+  choice=$(kdialog --title "$APP -- font" --menu "Font" \
+    keep "Keep $(get_text font)" \
+    listed "Choose from installed fonts" \
+    type "Type a font name" \
+    back "Back")
+  [ $? -ne 0 ] && return 0
+
+  case "$choice" in
+    listed)
+      local list=() names
+      names=$(fc-list : family 2>/dev/null | tr ',' '\n' | sort -u | head -n 40)
+      [ -z "$names" ] && { kdialog --error "fc-list is not available on this system."; return 0; }
+      while IFS= read -r family; do
+        [ -n "$family" ] && list+=("$family" "$family")
+      done <<< "$names"
+      family=$(kdialog --title "$APP -- font" --menu "Pick a font" "${list[@]}")
+      [ $? -ne 0 ] && return 0
+      [ -z "$family" ] && return 0
+      set_text font "$family"
+      sync_conf_font
+      restart_widget
+      ;;
+    type)
+      family=$(kdialog --inputbox "Font name, exactly as it appears in your font list" "$(get_text font)")
+      [ -z "$family" ] && return 0
+      set_text font "$family"
+      sync_conf_font
+      restart_widget
+      ;;
+  esac
+}
+
+sync_conf_font() {
+  local family size weight
+  family=$(get_text font)
+  size=$(get_num font_size)
+  weight=$(get_num weight)
+  case "$weight" in
+    *[7-9]*) weight="bold" ;;
+    6*) weight="demibold" ;;
+    5*) weight="medium" ;;
+    *) weight="normal" ;;
+  esac
+  conf_set font "'$family:size=$size:weight=$weight'"
+}
+
+text_menu() {
+  while true; do
+    local choice value
+    choice=$(kdialog --title "$APP -- text" --menu "Text" \
+      font "Font ($(get_text font))" \
+      font_size "Size ($(get_num font_size))" \
+      weight "Weight" \
+      uppercase "Capital letters: $(get_value_word uppercase)" \
+      label_mode "Label position: $(get_text label_mode)" \
+      separator "Divider lines: $(get_value_word separator)" \
+      back "Back")
+    [ $? -ne 0 ] && return 0
+
+    case "$choice" in
+      font) font_choice ;;
+      font_size)
+        value=$(number_input "Text size in pixels" "$(get_num font_size)" 8 32) || continue
+        set_num font_size "$value"
+        sync_conf_font
+        restart_widget
+        ;;
+      weight)
+        value=$(kdialog --title "$APP -- weight" --menu "Weight" \
+          400 "Regular" 500 "Medium" 600 "Semi bold" 700 "Bold")
+        [ $? -ne 0 ] && continue
+        set_num weight "$value"
+        sync_conf_font
+        restart_widget
+        ;;
+      uppercase)
+        if [ "$(get_raw uppercase)" = "true" ]; then set_bool uppercase false; else set_bool uppercase true; fi
+        ;;
+      label_mode)
+        value=$(kdialog --title "$APP -- labels" --menu "Where should the label sit?" \
+          left "Left, value on the right" above "Label above the value" inline "Label and value together")
+        [ $? -ne 0 ] && continue
+        set_text label_mode "$value"
+        ;;
+      separator)
+        if [ "$(get_raw separator)" = "true" ]; then set_bool separator false; else set_bool separator true; fi
+        ;;
+      back) return 0 ;;
+    esac
+  done
+}
+
+get_value_word() {
+  if [ "$(get_raw "$1")" = "true" ]; then echo "on"; else echo "off"; fi
+}
+
+count_readings() {
+  local id count=0
+  for id in "${all_readings[@]}"; do
+    if runs_on "$id"; then count=$((count + 1)); fi
+  done
+  printf '%s' "$count"
+}
+
+# ------------------------------------------------------------------- panel ---
+
+sync_conf_padding() { conf_set border_inner_margin "$(get_num padding)"; }
+
+panel_menu() {
+  while true; do
+    local choice value
+    choice=$(kdialog --title "$APP -- panel" --menu "Panel" \
+      padding "Padding ($(get_num padding)px)" \
+      chart_height "Chart height ($(get_num chart_height)px)" \
+      bar_height "Bar thickness ($(get_num bar_height)px)" \
+      bar_width "Chart width ($(get_num bar_width)px)" \
+      border_width "Border ($(get_num border_width)px)" \
+      glow "Glow: $(get_value_word glow)" \
+      back "Back")
+    [ $? -ne 0 ] && return 0
+
+    case "$choice" in
+      padding)
+        value=$(number_input "Space between the panel edge and the text" "$(get_num padding)" 0 40) || continue
+        set_num padding "$value"
+        sync_conf_padding
+        restart_widget
+        ;;
+      chart_height)
+        value=$(number_input "Height of line charts and gauges" "$(get_num chart_height)" 10 60) || continue
+        set_num chart_height "$value"
+        ;;
+      bar_height)
+        value=$(number_input "Thickness of the bars" "$(get_num bar_height)" 2 14) || continue
+        set_num bar_height "$value"
+        ;;
+      bar_width)
+        value=$(number_input "Width of bars and charts" "$(get_num bar_width)" 60 400) || continue
+        set_num bar_width "$value"
+        ;;
+      border_width)
+        value=$(number_input "Border thickness (0 for none)" "$(get_num border_width)" 0 6) || continue
+        set_num border_width "$value"
+        ;;
+      glow)
+        if [ "$(get_raw glow)" = "true" ]; then set_bool glow false; else set_bool glow true; fi
+        ;;
+      back) return 0 ;;
+    esac
+  done
+}
+
+# -------------------------------------------------------------- placement ---
+
+placement_menu() {
+  while true; do
+    local choice value
+    choice=$(kdialog --title "$APP -- position" --menu "Position" \
+      corner "Screen corner: $(get_text_from_conf alignment)" \
+      gap_x "Side gap ($(get_num_from_conf gap_x)px)" \
+      gap_y "Top / bottom gap ($(get_num_from_conf gap_y)px)" \
+      update_interval "Refresh every ($(get_num_from_conf update_interval)s)" \
+      back "Back")
+    [ $? -ne 0 ] && return 0
+
+    case "$choice" in
+      corner)
+        value=$(kdialog --title "$APP -- corner" --menu "Where should the panel sit?" \
+          top_left "Top left" top_middle "Top centre" top_right "Top right" \
+          middle_left "Centre left" middle_middle "Dead centre" middle_right "Centre right" \
+          bottom_left "Bottom left" bottom_middle "Bottom centre" bottom_right "Bottom right")
+        [ $? -ne 0 ] && continue
+        conf_set alignment "'$value'"
+        restart_widget
+        ;;
+      gap_x)
+        value=$(number_input "Distance from the side of the screen" "$(get_num_from_conf gap_x)" 0 400) || continue
+        conf_set gap_x "$value"
+        restart_widget
+        ;;
+      gap_y)
+        value=$(number_input "Distance from the top or bottom of the screen" "$(get_num_from_conf gap_y)" 0 400) || continue
+        conf_set gap_y "$value"
+        restart_widget
+        ;;
+      update_interval)
+        value=$(number_input "Seconds between refreshes" "$(get_num_from_conf update_interval)" 1 30) || continue
+        conf_set update_interval "$value"
+        restart_widget
+        ;;
+      back) return 0 ;;
+    esac
+  done
+}
+
+get_num_from_conf() { sed -n "s/^ *$1 = \([0-9]*\),\$/\1/p" "$CONF" | head -n 1; }
+get_text_from_conf() { sed -n "s/^ *$1 = '\(.*\)',\$/\1/p" "$CONF" | head -n 1; }
+
+# ------------------------------------------------------------------ theme ---
+
+match_theme() {
+  local bg fg inactive accent family pt size note=""
+
+  bg=$(theme_value "Colors:Window" "BackgroundNormal")
+  fg=$(theme_value "Colors:Window" "ForegroundNormal")
+  inactive=$(theme_value "Colors:Window" "ForegroundInactive")
+  accent=$(theme_value "Colors:Selection" "BackgroundNormal")
+
+  if [ -n "$bg" ]; then set_text bg "$(rgb_hex "$bg")"; note="$note\nPanel colour"; fi
+  if [ -n "$fg" ]; then set_text text "$(rgb_hex "$fg")"; note="$note\nText colour"; fi
+  if [ -n "$inactive" ]; then set_text label "$(rgb_hex "$inactive")"; note="$note\nLabel colour"; fi
+  if [ -n "$accent" ]; then
+    set_text accent "$(rgb_hex "$accent")"
+    set_text bar "$(rgb_hex "$accent")"
+    note="$note\nAccent and bars"
+  fi
+
+  family=$(awk -F= '/^font=/{print $2}' "$HOME/.config/kdeglobals" 2>/dev/null | head -n 1 | cut -d, -f1 | sed 's/^ *//; s/ *$//')
+  pt=$(awk -F= '/^font=/{print $2}' "$HOME/.config/kdeglobals" 2>/dev/null | head -n 1 | cut -d, -f2 | grep -Eo '^[0-9]+')
+  if [ -n "$pt" ]; then
+    size=$(awk -v pt="$pt" 'BEGIN { printf "%d", pt * 1.3333 + 0.5 }')
+    set_num font_size "$size"
+    note="$note\nText size"
+  fi
+  if [ -n "$family" ]; then
+    set_text font "$family"
+    note="$note\nFont $family"
+  fi
+
+  if [ -z "$note" ]; then
+    kdialog --error "No Plasma colour scheme was found in ~/.config/kdeglobals."
+    return 0
+  fi
+
+  sync_conf_colours
+  sync_conf_font
+  restart_widget
+
+  local bgimg
+  bgimg=$(get_text bg_image)
+  if [ -n "$bgimg" ]; then
+    note="$note\n\nSet the panel transparency above 0 to see the background image."
+  fi
+  kdialog --msgbox "Matched your Plasma theme:$(printf '%b' "$note")"
+}
+
+# --------------------------------------------------------------- readings ---
+
+all_readings=(cpu cores ram swap gpu gputemp temp fan freq disk diski net wifi load top topmem running processes battery uptime transfer kernel clock)
+reading_titles=(CPU "CPU cores" "Memory" "Swap" "GPU usage" "GPU temperature" "CPU temperature" "Fan speed" "CPU frequency" "Disk" "Disk activity" "Network up / down" "Wi-Fi signal" "Load average" "Top processes" "Top memory users" "Running processes" "Process count" "Battery" "Uptime" "Data transferred" "Kernel" "Clock")
+
+pick_readings() {
+  local args=() i=0 picked
+  for id in "${all_readings[@]}"; do
+    if runs_on "$id"; then args+=("$id" "${reading_titles[$i]}" on); else args+=("$id" "${reading_titles[$i]}" off); fi
+    i=$((i + 1))
+  done
+
+  picked=$(kdialog --title "$APP -- readings" --separate-output --checklist "Which readings should the panel show?" "${args[@]}")
+  [ $? -ne 0 ] && return 0
+
+  local list
+  list=" $(printf '%s' "$picked" | tr '\n' ' ') "
+  for id in "${all_readings[@]}"; do
+    case "$list" in
+      *" $id "*) r_bool "$id" on true ;;
+      *) r_bool "$id" on false ;;
+    esac
+  done
+}
+
+reading_options() {
+  local id field value changed=0
+  for id in "${all_readings[@]}"; do
+    runs_on "$id" || continue
+    case "$id" in
+      disk)
+        value=$(kdialog --inputbox "Which mount point should the disk reading watch?" "$(r_text disk target)")
+        if [ -n "$value" ]; then r_text_set disk target "$value"; changed=1; fi
+        ;;
+      net)
+        value=$(kdialog --inputbox "Which network interface? Leave empty to total every interface." "$(r_text net target)")
+        if [ -n "$value" ]; then r_text_set net target "$value"; changed=1; fi
+        ;;
+      temp)
+        value=$(kdialog --inputbox "Which hwmon sensor number? (run: sensors)" "$(r_text temp target)")
+        if [ -n "$value" ]; then r_text_set temp target "$value"; changed=1; fi
+        ;;
+      gpu)
+        value=$(kdialog --inputbox "GPU source. Leave empty to detect your card, or type nvidia for the NVIDIA variables." "$(r_text gpu target)")
+        if [ -n "$value" ]; then r_text_set gpu target "$value"; changed=1; fi
+        ;;
+      gputemp)
+        value=$(kdialog --inputbox "GPU temperature sensor. Leave empty to detect it, type nvidia, or name a hwmon device (amdgpu, radeon, xe, or a number)." "$(r_text gputemp target)")
+        if [ -n "$value" ]; then r_text_set gputemp target "$value"; changed=1; fi
+        ;;
+      fan)
+        value=$(kdialog --inputbox "Which device holds the fan sensor? A hwmon number (0, 1, ...) or a module name such as k10temp or amdgpu." "$(r_text fan target)")
+        if [ -n "$value" ]; then r_text_set fan target "$value"; changed=1; fi
+        ;;
+      diski)
+        value=$(kdialog --inputbox "Which disk should the activity reading watch? Leave empty for every disk." "$(r_text diski target)")
+        if [ -n "$value" ]; then r_text_set diski target "$value"; changed=1; fi
+        ;;
+      wifi)
+        value=$(kdialog --inputbox "Which wireless interface? (run: iw dev)" "$(r_text wifi target)")
+        if [ -n "$value" ]; then r_text_set wifi target "$value"; changed=1; fi
+        ;;
+      topmem)
+        value=$(number_input "How many memory-hungry processes should be listed?" "$(r_num topmem count)" 1 5) && { r_set topmem count "$value"; changed=1; }
+        ;;
+      cores)
+        value=$(number_input "How many cores should be listed?" "$(r_num cores count)" 1 16) && { r_set cores count "$value"; changed=1; }
+        ;;
+      top)
+        value=$(number_input "How many processes should be listed?" "$(r_num top count)" 1 5) && { r_set top count "$value"; changed=1; }
+        ;;
+      battery)
+        value=$(kdialog --inputbox "Which battery device?" "$(r_text battery target)")
+        if [ -n "$value" ]; then r_text_set battery target "$value"; changed=1; fi
+        ;;
+      clock)
+        value=$(kdialog --inputbox "Time format (%H:%M, %H:%M:%S, %a %d %b ...)" "$(r_text clock format)")
+        if [ -n "$value" ]; then r_text_set clock format "$value"; changed=1; fi
+        ;;
+    esac
+
+    value=$(kdialog --inputbox "Optional label for this reading. Leave empty for the default." "$(r_text "$id" label)")
+    if [ -n "$value" ]; then r_text_set "$id" label "$value"; changed=1; fi
+  done
+
+  if [ "$changed" = "0" ]; then
+    kdialog --msgbox "Nothing changed."
+  fi
+}
+
+chart_supports() { # id, kind -> 0 when the reading can draw that chart
+  case "$2" in
+    line) case "$1" in cpu|ram|swap|gpu|gputemp|disk|net|wifi|temp|fan|freq|load|battery) return 0 ;; esac ;;
+    bar|gauge|pie|donut) case "$1" in cpu|ram|swap|gpu|gputemp|disk|cores|wifi|temp|battery) return 0 ;; esac ;;
+    none) return 0 ;;
+  esac
+  return 1
+}
+
+pick_charts() {
+  local id choice current_kind
+  for id in "${all_readings[@]}"; do
+    runs_on "$id" || continue
+    case "$id" in uptime|processes|clock|top|topmem|running|diski|transfer|kernel) continue ;; esac
+    current_kind=$(r_text "$id" chart)
+
+    local args=(none "No chart")
+    chart_supports "$id" bar && args+=(bar "Bar")
+    chart_supports "$id" line && args+=(line "Line graph")
+    chart_supports "$id" gauge && args+=(gauge "Gauge")
+    chart_supports "$id" pie && args+=(pie "Pie")
+    chart_supports "$id" donut && args+=(donut "Donut")
+
+    choice=$(kdialog --title "$APP -- charts" --menu "Chart for ${id} (currently $current_kind)" "${args[@]}")
+    [ $? -ne 0 ] && continue
+    [ -z "$choice" ] && continue
+    r_text_set "$id" chart "$choice"
+  done
+}
+
+readings_menu() {
+  while true; do
+    local choice
+    choice=$(kdialog --title "$APP -- readings" --menu "Readings" \
+      pick "Choose readings" \
+      options "Targets, labels and formats" \
+      charts "Charts" \
+      back "Back")
+    [ $? -ne 0 ] && return 0
+
+    case "$choice" in
+      pick) pick_readings ;;
+      options) reading_options ;;
+      charts) pick_charts ;;
+      back) return 0 ;;
+    esac
+  done
+}
+
+# ------------------------------------------------------------------- main ---
+
+sync_conf_colours
+sync_conf_padding
+sync_conf_font
+
+while true; do
+  action=$(kdialog --title "$APP settings" --menu "Widget settings" \
+    readings "Readings ($(count_readings) shown)" \
+    colours "Colours" \
+    background "Background" \
+    text "Text" \
+    panel "Panel" \
+    placement "Position" \
+    theme "Match my Plasma theme" \
+    restart "Restart the widget" \
+    quit "Close")
+  [ $? -ne 0 ] && break
+
+  case "$action" in
+    readings) readings_menu ;;
+    colours) colour_menu ;;
+    background) background_menu ;;
+    text) text_menu ;;
+    panel) panel_menu ;;
+    placement) placement_menu ;;
+    theme) match_theme ;;
+    restart) restart_widget && kdialog --msgbox "The widget was restarted." ;;
+    quit|'') break ;;
+  esac
+done
+
+exit 0
